@@ -2,7 +2,8 @@ const fs = require("fs/promises");
 const path = require("path");
 const fetch = require("node-fetch");
 const yargs = require('yargs/yargs')
-const { hideBin } = require('yargs/helpers')
+const { hideBin } = require('yargs/helpers');
+const mkdirp = require("mkdirp");
 
 const argv = yargs(hideBin(process.argv))
     .option('subject', {
@@ -10,11 +11,17 @@ const argv = yargs(hideBin(process.argv))
         description: 'Email subject',
         required: true
     })
+    .option('dir', {
+        type: 'string',
+        description: 'Destination directory'
+    })
     .argv;
 
 async function main() {
     // Load the auth token
     var token = (await fs.readFile("token.txt")).toString();
+    const dataDir = argv.dir || path.join(process.cwd(), "data");
+    await mkdirp(dataDir);
 
     // Start pulling emails
     let emailsUrl = `https://graph.microsoft.com/v1.0/me/messages?$filter=subject eq '${argv.subject}'`;
@@ -32,10 +39,10 @@ async function main() {
 
             const attachment = attachments.value[0];
             const data = Buffer.from(attachment.contentBytes, 'base64');
-            await fs.writeFile(path.join(process.cwd(), "data", attachment.name), data);
+            await fs.writeFile(path.join(dataDir, attachment.name), data);
         };
 
-        emailsUrl = emailsResponse["@odata.nextLink"];
+        emailsUrl = undefined; // emailsResponse["@odata.nextLink"];
     } while (typeof emailsUrl != "undefined");
     
 }
