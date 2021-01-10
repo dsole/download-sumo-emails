@@ -4,6 +4,7 @@ const fetch = require("node-fetch");
 const yargs = require('yargs/yargs')
 const { hideBin } = require('yargs/helpers');
 const mkdirp = require("mkdirp");
+const { isString } = require("util");
 
 const argv = yargs(hideBin(process.argv))
     .option('subject', {
@@ -15,6 +16,21 @@ const argv = yargs(hideBin(process.argv))
         type: 'string',
         description: 'Destination directory'
     })
+    .option('inbox', {
+        type: "boolean",
+        description: "Process messages from Inbox?",
+        default: false
+    })
+    .option('cleanup', {
+        type: "boolean",
+        description: "Cleanup after download?",
+        default: true
+    })
+    .option('limit', {
+        type: "number",
+        description: "Process X messages",
+        default: 0
+    })
     .argv;
 
 async function main() {
@@ -23,10 +39,21 @@ async function main() {
     const dataDir = argv.dir || path.join(process.cwd(), "data");
     await mkdirp(dataDir);
 
+    // Find the Inbox folder ids
+    const inboxFolderId = await getFolderId("Inbox", token);
+    const sumoFolderId = await getChildFolderId(inboxFolderId, "SumoLogic", token);
+    const downloadedFolderId = await getChildFolderId(sumoFolderId, "Downloaded", token);
+
+    const sourceFolder = argv.inbox ? inboxFolderId : sumoFolderId;   
+
     // Start pulling emails
-    let emailsUrl = `https://graph.microsoft.com/v1.0/me/messages?$filter=subject eq '${argv.subject}'`;
+    let emailsUrl = `https://graph.microsoft.com/v1.0/me/mailFolders/${sourceFolder}/messages?$filter=subject eq '${argv.subject}'`;
+
+    let stop = false;
+    let count = 0;
 
     do {
+        const processedEmailIds = [];
         const emailsResponse = await loadEmails(emailsUrl, token);
 
         // For each email, download the attachment
@@ -39,15 +66,35 @@ async function main() {
 
             const attachment = attachments.value[0];
             const data = Buffer.from(attachment.contentBytes, 'base64');
-            await fs.writeFile(path.join(dataDir, attachment.name), data);
+            console.log("Writing file", attachment.name, "...");
+            const filePath = path.join(dataDir, attachment.name);
+            const fileDate = new Date(email.receivedDateTime);
+            await fs.writeFile(filePath, data);
+            await fs.utimes(filePath, fileDate, fileDate);
+
+            processedEmailIds.push(email.id);
+
+            count++;
+            stop = argv.limit > 0 && count >= argv.limit;
+            if (stop) break;
         };
 
-        emailsUrl = undefined; // emailsResponse["@odata.nextLink"];
-    } while (typeof emailsUrl != "undefined");
-    
+        // Move processed emails to folder.
+        if (argv.cleanup) {
+            for (processedEmailId of processedEmailIds) {
+                await moveEmailToFolder(processedEmailId, downloadedFolderId, token);
+            }
+        }
+
+        emailsUrl = emailsResponse["@odata.nextLink"];
+    } while (!stop && typeof emailsUrl != "undefined");
+
+    console.log("Done!");
 }
 
 main();
+
+// ====================================
 
 async function loadEmails(url, token) {
 
@@ -62,12 +109,17 @@ async function getAttachments(id, token) {
     return await callApi(url, token);
 }
 
-async function callApi(url, token) {
-    const response = await fetch(url, {
-        headers: {
-            Authorization: "Bearer " + token
-        }
-    });
+async function callApi(url, options) {
+    // Options can either be the token or an options object
+    if (typeof options === "string") {
+        options = {
+            headers: {
+                Authorization: "Bearer " + options
+            }
+        };
+    }
+
+    const response = await fetch(url, options);
 
     if (!response.ok) {
         if (response.status == 429) { // Too many requests 
@@ -85,4 +137,34 @@ async function callApi(url, token) {
         const json = await response.json();
         return json;
     }
+}
+
+async function getFolderId(name, token) {
+    console.log(`Fetching folder ${name} ...`);
+    const url = `https://graph.microsoft.com/v1.0/me/mailFolders?filter=displayName eq '${name}'`;
+    const rootFolder = await callApi(url, token);
+    return rootFolder.value[0].id;
+}
+
+
+async function getChildFolderId(parentId, name, token) {
+    console.log(`Fetching child folder ${name} ...`);
+    const url = `https://graph.microsoft.com/v1.0/me/mailFolders/${parentId}/childFolders?filter=displayName eq '${name}'`;
+    const rootFolder = await callApi(url, token);
+    return rootFolder.value[0].id;
+}
+
+async function moveEmailToFolder(emailId, folderId, token) {
+    console.log("Moving email...");
+    const url = `https://graph.microsoft.com/v1.0/me/messages/${emailId}/move`;
+    await callApi(url, {
+        method: "POST",
+        body: JSON.stringify({
+            destinationId: folderId
+        }),
+        headers: {
+            Authorization: "Bearer " + token,
+            "Content-type": "application/json"
+        }
+    });
 }
