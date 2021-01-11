@@ -4,7 +4,6 @@ const fetch = require("node-fetch");
 const yargs = require('yargs/yargs')
 const { hideBin } = require('yargs/helpers');
 const mkdirp = require("mkdirp");
-const { isString } = require("util");
 
 const argv = yargs(hideBin(process.argv))
     .option('subject', {
@@ -34,12 +33,14 @@ const argv = yargs(hideBin(process.argv))
     .argv;
 
 async function main() {
-    // Load the auth token
-    var token = (await fs.readFile("token.txt")).toString();
+    // Load the auth token. Just saved statically in a file for now..
+    var token = await getAccessToken();
+
+    // Set up the output directory
     const dataDir = argv.dir || path.join(process.cwd(), "data");
     await mkdirp(dataDir);
 
-    // Find the Inbox folder ids
+    // Find the Inbox folders' ids and pick the source folder
     const inboxFolderId = await getFolderId("Inbox", token);
     const sumoFolderId = await getChildFolderId(inboxFolderId, "SumoLogic", token);
     const downloadedFolderId = await getChildFolderId(sumoFolderId, "Downloaded", token);
@@ -64,16 +65,11 @@ async function main() {
                 throw new Error("Wrong number of attachments, " + email.id);
             }
 
+            // Just assuming there's one attachment for now, since we know that to be true.
             const attachment = attachments.value[0];
-            const data = Buffer.from(attachment.contentBytes, 'base64');
-            console.log("Writing file", attachment.name, "...");
-            const filePath = path.join(dataDir, attachment.name);
-            const fileDate = new Date(email.receivedDateTime);
-            await fs.writeFile(filePath, data);
-            await fs.utimes(filePath, fileDate, fileDate);
+            await saveAttachment(attachment, dataDir, email.receivedDateTime);
 
             processedEmailIds.push(email.id);
-
             count++;
             stop = argv.limit > 0 && count >= argv.limit;
             if (stop) break;
@@ -86,6 +82,7 @@ async function main() {
             }
         }
 
+        // Get the URL for the next page of data
         emailsUrl = emailsResponse["@odata.nextLink"];
     } while (!stop && typeof emailsUrl != "undefined");
 
@@ -96,15 +93,19 @@ main();
 
 // ====================================
 
-async function loadEmails(url, token) {
+async function getAccessToken() {
+    // Load the auth token. Just saved statically in a file for now..
+    var token = (await fs.readFile("token.txt")).toString();
+    return token;
+}
 
+async function loadEmails(url, token) {
     console.log("Fetching emails...");
     return await callApi(url, token);
 }
 
 async function getAttachments(id, token) {
     const url = `https://graph.microsoft.com/v1.0/me/messages/${id}/attachments`;
-
     console.log("Fetching attachments...");
     return await callApi(url, token);
 }
@@ -122,7 +123,7 @@ async function callApi(url, options) {
     const response = await fetch(url, options);
 
     if (!response.ok) {
-        if (response.status == 429) { // Too many requests 
+        if (response.status == 429) { // Too many requests. Retry after the provided number of seconds
             const retryAfter = response.headers.get("Retry-After");
             console.log("'Too many requests' received. Waiting", retryAfter);
             console.log(Date.now());
@@ -167,4 +168,13 @@ async function moveEmailToFolder(emailId, folderId, token) {
             "Content-type": "application/json"
         }
     });
+}
+
+async function saveAttachment(attachment, dataDir, time) {
+    const data = Buffer.from(attachment.contentBytes, 'base64');
+    console.log("Writing file", attachment.name, "...");
+    const filePath = path.join(dataDir, attachment.name);
+    const fileDate = new Date(time);
+    await fs.writeFile(filePath, data);
+    await fs.utimes(filePath, fileDate, fileDate);
 }
